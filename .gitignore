@@ -1,0 +1,12 @@
+*.o
+Backend
+Frontend
+Sandbox
+infinite_loop
+memory_hog
+sleep_forever
+ignore_sigterm
+normal_exit
+sandbox.log
+*.swp
+/tmp/
