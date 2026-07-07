@@ -9,11 +9,17 @@
 #include <errno.h>
 #include <pwd.h>
 #include <sys/types.h>
+#include <signal.h>
+#include <sys/stat.h>   // for chmod
 
 #define SOCK_PATH "/tmp/auth_sock"
 #define UNPRIV_UID 65534   // nobody
 #define VALID_USER "admin"
 #define VALID_PASS "secret123"
+
+// Default expected UID (allowed to connect)
+// Can be overridden with environment variable EXPECTED_UID
+#define DEFAULT_EXPECTED_UID 1000   // change to your user's UID
 
 void secure_clear(void *ptr, size_t len) {
     explicit_bzero(ptr, len);
@@ -29,51 +35,114 @@ int main(void) {
     char ctrl_buf[CMSG_SPACE(sizeof(struct ucred))];
     struct ucred *cred;
     ssize_t n;
+    pid_t pid = getpid();
 
-    // 1. Create socket
+    // Read expected UID from environment, or use default
+    char *env_uid = getenv("EXPECTED_UID");
+    uid_t expected_uid = (env_uid) ? atoi(env_uid) : DEFAULT_EXPECTED_UID;
+
+    // ---- Log initial privilege state ----
+    printf("[Backend] [pid %d] starting; initial privilege state:\n", pid);
+    printf("[Backend] [pid %d] startup -> getuid()=%d geteuid()=%d\n", pid, getuid(), geteuid());
+
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                printf("[Backend] [pid %d] startup -> /proc/self/status %s", pid, line);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    // ---- Create socket ----
     sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockfd == -1) { perror("socket"); exit(1); }
 
-    // ***** Enable credential receiving *****
     int on = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == -1) {
-        perror("setsockopt SO_PASSCRED");
-        exit(1);
+        perror("setsockopt SO_PASSCRED"); exit(1);
     }
 
-    // 2. Bind
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
     unlink(SOCK_PATH);
+
     if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         perror("bind"); exit(1);
     }
+
+    // ---- Make socket accessible to all users ----
+    if (chmod(SOCK_PATH, 0666) == -1) {
+        perror("chmod"); exit(1);
+    }
+
     if (listen(sockfd, 5) == -1) {
         perror("listen"); exit(1);
     }
 
-    printf("[Backend] Listening on %s\n", SOCK_PATH);
+    printf("[Backend] [pid %d] listening on %s\n", pid, SOCK_PATH);
 
-    // 3. Drop privileges permanently NOW (before accept)
+    // ---- PERMANENT PRIVILEGE DROP ----
     if (setresuid(UNPRIV_UID, UNPRIV_UID, UNPRIV_UID) == -1) {
         perror("setresuid"); exit(1);
     }
-    if (geteuid() != UNPRIV_UID) {
-        fprintf(stderr, "Privilege drop failed\n"); exit(1);
-    }
-    if (setuid(0) != -1) {
-        fprintf(stderr, "ERROR: setuid(0) succeeded – drop was reversible!\n");
+
+    // Verify irreversibility: try setuid(0) – must fail
+    int setuid_result = setuid(0);
+    if (setuid_result == -1) {
+        printf("[Backend] [pid %d] verified irreversibly: setuid(0) after drop correctly failed (%s)\n",
+               pid, strerror(errno));
+    } else {
+        fprintf(stderr, "[Backend] [pid %d] ERROR: setuid(0) succeeded – drop was reversible!\n", pid);
         exit(1);
     }
-    printf("[Backend] Privileges dropped to UID %d (irreversible)\n", UNPRIV_UID);
 
-    // 4. Main loop
+    printf("[Backend] [pid %d] post-drop -> getuid()=%d geteuid()=%d\n", pid, getuid(), geteuid());
+
+    fp = fopen("/proc/self/status", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                printf("[Backend] [pid %d] post-drop -> /proc/self/status %s", pid, line);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    // ---- Main loop ----
     while (1) {
         client_fd = accept(sockfd, NULL, NULL);
         if (client_fd == -1) { perror("accept"); continue; }
 
-        // Receive credentials and data
+        printf("[Backend] [pid %d] connection accepted\n", pid);
+
+        // Get peer credentials via SO_PEERCRED (for logging and UID check)
+        struct ucred peercred;
+        socklen_t len = sizeof(peercred);
+        if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &peercred, &len) == 0) {
+            printf("[Backend] [pid %d] kernel-verified peer credentials: pid=%d uid=%d gid=%d\n",
+                   pid, peercred.pid, peercred.uid, peercred.gid);
+        }
+
+        // ---- UID MISMATCH CHECK ----
+        // We'll check via SCM_CREDENTIALS, but we also have peercred from getsockopt.
+        // We'll use the peercred from getsockopt for the check.
+        if (peercred.uid != 0 && peercred.uid != expected_uid) {
+            const char *err = "ERROR: unauthorized user\n";
+            write(client_fd, err, strlen(err));
+            printf("[Backend] [pid %d] REJECTED: peer uid %d does not match expected uid %d (or root)\n",
+                   pid, peercred.uid, expected_uid);
+            close(client_fd);
+            continue;
+        }
+
+        // Receive message with SCM_CREDENTIALS
         iov.iov_base = buf;
         iov.iov_len = sizeof(buf) - 1;
         memset(&msg, 0, sizeof(msg));
@@ -86,10 +155,6 @@ int main(void) {
         if (n == -1) { perror("recvmsg"); close(client_fd); continue; }
         buf[n] = '\0';
 
-        // Debug: see if any control data arrived
-        printf("[Backend] recvmsg returned %ld bytes, controllen=%lu\n", n, (unsigned long)msg.msg_controllen);
-
-        // Extract credentials
         cmsg = CMSG_FIRSTHDR(&msg);
         if (!cmsg || cmsg->cmsg_type != SCM_CREDENTIALS) {
             const char *err = "ERROR: no credentials\n";
@@ -98,7 +163,8 @@ int main(void) {
             continue;
         }
         cred = (struct ucred *)CMSG_DATA(cmsg);
-        printf("[Backend] Request from UID=%d\n", cred->uid);
+        printf("[Backend] [pid %d] SCM_CREDENTIALS confirms sender pid=%d uid=%d\n",
+               pid, cred->pid, cred->uid);
 
         // Parse "user:password"
         if (sscanf(buf, "%63[^:]:%63s", user, pass) != 2) {
@@ -112,9 +178,11 @@ int main(void) {
         const char *response = ok ? "OK\n" : "FAIL\n";
         write(client_fd, response, strlen(response));
 
+        // Clear sensitive buffers
         secure_clear(pass, strlen(pass));
         secure_clear(buf, sizeof(buf));
 
+        printf("[Backend] [pid %d] request handled, sensitive buffers wiped, connection closed\n", pid);
         close(client_fd);
     }
 
