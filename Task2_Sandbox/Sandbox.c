@@ -119,31 +119,49 @@ int main(int argc, char *argv[]) {
         pthread_create(&t3, NULL, mem_monitor, NULL);
 
         int status;
-        pid_t wpid = waitpid(pid, &status, 0);
-        if (wpid == -1) { perror("waitpid"); }
+        int terminated = 0;
 
-        if (kill(pid, 0) == 0) {
-            log_action("Child still alive – sending SIGKILL");
-            kill(pid, SIGKILL);
-            waitpid(pid, NULL, 0);
+        // ---- NON-BLOCKING WAIT LOOP ----
+        while (!terminated) {
+            pid_t wpid = waitpid(pid, &status, WNOHANG);
+            if (wpid == pid) {
+                // Child has exited
+                terminated = 1;
+                if (WIFEXITED(status)) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "Child exited with status %d", WEXITSTATUS(status));
+                    log_action(msg);
+                } else if (WIFSIGNALED(status)) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "Child terminated by signal %d", WTERMSIG(status));
+                    log_action(msg);
+                }
+                break;
+            } else if (wpid == -1) {
+                perror("waitpid");
+                break;
+            }
+
+            // If child is still alive and should_stop was set, escalate to SIGKILL
+            if (should_stop) {
+                if (kill(pid, 0) == 0) {
+                    log_action("Child still alive – sending SIGKILL");
+                    kill(pid, SIGKILL);
+                    waitpid(pid, &status, 0); // reap it
+                    log_action("Child terminated by signal 9");
+                }
+                break;
+            }
+            usleep(100000); // 100 ms sleep to avoid busy loop
         }
 
+        // Cancel and join threads
         pthread_cancel(t1);
         pthread_cancel(t2);
         pthread_cancel(t3);
         pthread_join(t1, NULL);
         pthread_join(t2, NULL);
         pthread_join(t3, NULL);
-
-        if (WIFEXITED(status)) {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "Child exited with status %d", WEXITSTATUS(status));
-            log_action(msg);
-        } else if (WIFSIGNALED(status)) {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "Child terminated by signal %d", WTERMSIG(status));
-            log_action(msg);
-        }
 
         printf("Sandbox done. Check sandbox.log for details.\n");
         return 0;
